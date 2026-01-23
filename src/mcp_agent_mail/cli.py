@@ -48,7 +48,7 @@ from .config import get_settings
 from .db import ensure_schema, get_session, reset_database_state
 from .guard import install_guard as install_guard_script, uninstall_guard as uninstall_guard_script
 from .http import build_http_app
-from .models import Agent, FileReservation, Message, MessageRecipient, Product, ProductProjectLink, Project
+from .models import Agent, AgentLink, FileReservation, Message, MessageRecipient, Product, ProductProjectLink, Project
 from .share import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_CHUNK_THRESHOLD,
@@ -4725,6 +4725,247 @@ def doctor_restore(
             console.print(f"  [green]Bundle restored:[/green] {bundle}")
         for error in result.get("errors", []):
             console.print(f"  [red]Error:[/red] {error}")
+
+
+def _is_server_running() -> bool:
+    """Check if the MCP Agent Mail server is running via HTTP liveness endpoint."""
+    settings = get_settings()
+    url = f"http://{settings.http.host}:{settings.http.port}/health/liveness"
+    try:
+        with httpx.Client(timeout=2.0) as client:
+            return client.get(url).status_code == 200
+    except Exception:
+        return False
+
+
+def _find_ai_agent_processes() -> list[tuple[str, int]]:
+    """Find running claude or codex processes."""
+    running: list[tuple[str, int]] = []
+    try:
+        import psutil
+
+        for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+            name = (proc.info.get("name") or "").lower()
+            if name in ("claude", "codex"):
+                running.append((name, proc.info["pid"]))
+    except ImportError:
+        # Fallback: use pgrep
+        for name in ["claude", "codex"]:
+            result = subprocess.run(["pgrep", "-x", name], capture_output=True, text=True)
+            for pid in result.stdout.strip().split("\n"):
+                if pid:
+                    running.append((name, int(pid)))
+    return running
+
+
+@doctor_app.command("prune-stale-agents")
+def doctor_prune_stale_agents(
+    project: Annotated[
+        Optional[str],
+        typer.Argument(help="Project slug (optional - prunes all if omitted)"),
+    ] = None,
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview without deleting"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip server/process checks"),
+) -> None:
+    """Remove empty agent accounts that have no mail or reservations.
+
+    Agents are considered "stale" when they have:
+    - No messages sent
+    - No messages received
+    - No active file reservations
+    - No agent links
+
+    This typically happens after setup re-assigns identities.
+    """
+
+    async def _run() -> dict[str, Any]:
+        await ensure_schema()
+        async with get_session() as session:
+            # Resolve project if specified
+            project_id: int | None = None
+            if project:
+                proj_stmt = _sa_select(Project).where(
+                    _sa_or(Project.slug == project, Project.human_key == project)
+                )
+                proj_result = await session.execute(proj_stmt)
+                proj_obj = proj_result.scalar_one_or_none()
+                if not proj_obj:
+                    return {"error": f"Project not found: {project}"}
+                project_id = proj_obj.id
+
+            # Build subqueries for existence checks
+            has_sent = _sa_select(Message.id).where(Message.sender_id == Agent.id).exists()
+            has_received = _sa_select(MessageRecipient.message_id).where(
+                MessageRecipient.agent_id == Agent.id
+            ).exists()
+            has_reservations = _sa_select(FileReservation.id).where(
+                and_(FileReservation.agent_id == Agent.id, FileReservation.released_ts.is_(None))
+            ).exists()
+            has_links = _sa_select(AgentLink.id).where(
+                _sa_or(AgentLink.a_agent_id == Agent.id, AgentLink.b_agent_id == Agent.id)
+            ).exists()
+
+            # Find stale agents
+            stmt = _sa_select(Agent).where(
+                ~has_sent,
+                ~has_received,
+                ~has_reservations,
+                ~has_links,
+            )
+            if project_id:
+                stmt = stmt.where(Agent.project_id == project_id)
+
+            # Join with Project for display
+            stmt = stmt.order_by(Agent.project_id, Agent.name)
+            result = await session.execute(stmt)
+            stale_agents = list(result.scalars().all())
+
+            # Collect project info for display
+            if stale_agents:
+                proj_ids = {a.project_id for a in stale_agents}
+                proj_stmt = _sa_select(Project).where(Project.id.in_(proj_ids))
+                proj_result = await session.execute(proj_stmt)
+                projects_by_id = {p.id: p for p in proj_result.scalars().all()}
+            else:
+                projects_by_id = {}
+
+            return {
+                "stale_agents": stale_agents,
+                "projects_by_id": projects_by_id,
+            }
+
+    async def _delete_agents(agent_ids: list[int]) -> int:
+        """Delete agents and their related records respecting FK constraints."""
+        await ensure_schema()
+        async with get_session() as session:
+            deleted_count = 0
+            for agent_id in agent_ids:
+                # 1. Delete message_recipients
+                await session.execute(
+                    text("DELETE FROM message_recipients WHERE agent_id = :aid"),
+                    {"aid": agent_id},
+                )
+                # 2. Delete file_reservations
+                await session.execute(
+                    text("DELETE FROM file_reservations WHERE agent_id = :aid"),
+                    {"aid": agent_id},
+                )
+                # 3. Delete agent_links
+                await session.execute(
+                    text("DELETE FROM agent_links WHERE a_agent_id = :aid OR b_agent_id = :aid"),
+                    {"aid": agent_id},
+                )
+                # 4. Delete the agent
+                await session.execute(
+                    text("DELETE FROM agents WHERE id = :aid"),
+                    {"aid": agent_id},
+                )
+                deleted_count += 1
+            await session.commit()
+            return deleted_count
+
+    # Pre-flight checks (unless --force)
+    if not force:
+        console.print("\n[bold]Pre-flight checks:[/bold]")
+
+        # Check 1: Server running
+        if _is_server_running():
+            settings = get_settings()
+            console.print(f"  [red][FAIL][/red] Server not running")
+            console.print(
+                f"\n[red]Error:[/red] MCP Agent Mail server is running on "
+                f"{settings.http.host}:{settings.http.port}"
+            )
+            console.print("Please stop the server before pruning stale agents.")
+            raise typer.Exit(code=1)
+        console.print("  [green][OK][/green] Server not running")
+
+        # Check 2: AI agent processes
+        ai_processes = _find_ai_agent_processes()
+        if ai_processes:
+            console.print("  [red][FAIL][/red] AI agents running")
+            console.print("\n[red]Error:[/red] Found running AI agents:")
+            for name, pid in ai_processes:
+                console.print(f"  - {name} (PID {pid})")
+            console.print("\nPlease kill these processes first, or use --force to bypass.")
+            raise typer.Exit(code=1)
+        console.print("  [green][OK][/green] No AI agents detected")
+        console.print()
+
+    # Find stale agents
+    try:
+        result = _run_async(_run())
+    except Exception as exc:
+        console.print(f"[red]Error finding stale agents:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if "error" in result:
+        console.print(f"[red]Error:[/red] {result['error']}")
+        raise typer.Exit(code=1)
+
+    stale_agents = result["stale_agents"]
+    projects_by_id = result["projects_by_id"]
+
+    if not stale_agents:
+        console.print("[green]No stale agents found.[/green]")
+        return
+
+    # Display stale agents in a table
+    if dry_run:
+        console.print("[bold cyan]Stale Agents Preview (dry run)[/bold cyan]\n")
+    else:
+        console.print(f"[bold]Found {len(stale_agents)} stale agents with no mail or reservations.[/bold]\n")
+
+    table = Table()
+    table.add_column("ID", style="dim")
+    table.add_column("Name")
+    table.add_column("Project")
+    table.add_column("Program")
+    table.add_column("Created")
+
+    for agent in stale_agents:
+        proj = projects_by_id.get(agent.project_id)
+        proj_name = proj.slug if proj else f"(id={agent.project_id})"
+        created_str = agent.inception_ts.strftime("%Y-%m-%d %H:%M:%S") if agent.inception_ts else "unknown"
+        table.add_row(
+            str(agent.id),
+            agent.name,
+            proj_name,
+            agent.program or "",
+            created_str,
+        )
+
+    console.print(table)
+
+    if dry_run:
+        console.print("\n[yellow]No changes made. Remove --dry-run to delete.[/yellow]")
+        return
+
+    # Confirmation
+    if not yes:
+        if not typer.confirm(f"\nDelete these {len(stale_agents)} agents?", default=False):
+            console.print("[yellow]Operation cancelled.[/yellow]")
+            return
+
+    # Perform deletion
+    agent_ids = [a.id for a in stale_agents]
+    try:
+        deleted_count = _run_async(_delete_agents(agent_ids))
+    except Exception as exc:
+        console.print(f"[red]Error deleting agents:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    # Summary by project
+    project_counts: dict[str, int] = {}
+    for agent in stale_agents:
+        proj = projects_by_id.get(agent.project_id)
+        proj_name = proj.slug if proj else f"(id={agent.project_id})"
+        project_counts[proj_name] = project_counts.get(proj_name, 0) + 1
+
+    console.print(f"\n[green]Deleted {deleted_count} agents:[/green]")
+    for proj_name, count in sorted(project_counts.items()):
+        console.print(f"  - {proj_name}: {count} agent{'s' if count != 1 else ''}")
 
 
 if __name__ == "__main__":
