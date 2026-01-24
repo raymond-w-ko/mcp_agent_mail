@@ -4758,6 +4758,28 @@ def _find_ai_agent_processes() -> list[tuple[str, int]]:
     return running
 
 
+def _preflight_checks(action: str) -> None:
+    """Run pre-flight checks for destructive operations. Exits on failure."""
+    console.print("\n[bold]Pre-flight checks:[/bold]")
+    if _is_server_running():
+        settings = get_settings()
+        console.print("  [red][FAIL][/red] Server is running")
+        console.print(f"\n[red]Error:[/red] Server running on {settings.http.host}:{settings.http.port}")
+        console.print(f"Please stop the server before {action}.")
+        raise typer.Exit(code=1)
+    console.print("  [green][OK][/green] Server not running")
+
+    ai_processes = _find_ai_agent_processes()
+    if ai_processes:
+        console.print("  [red][FAIL][/red] AI agents running")
+        console.print("\n[red]Error:[/red] Found running AI agents:")
+        for name, pid in ai_processes:
+            console.print(f"  - {name} (PID {pid})")
+        console.print("\nPlease kill these processes first, or use --force to bypass.")
+        raise typer.Exit(code=1)
+    console.print("  [green][OK][/green] No AI agents detected\n")
+
+
 @doctor_app.command("list-agents")
 def doctor_list_agents(
     project: Annotated[
@@ -5035,31 +5057,7 @@ def doctor_prune_stale_agents(
 
     # Pre-flight checks (unless --force)
     if not force:
-        console.print("\n[bold]Pre-flight checks:[/bold]")
-
-        # Check 1: Server running
-        if _is_server_running():
-            settings = get_settings()
-            console.print(f"  [red][FAIL][/red] Server not running")
-            console.print(
-                f"\n[red]Error:[/red] MCP Agent Mail server is running on "
-                f"{settings.http.host}:{settings.http.port}"
-            )
-            console.print("Please stop the server before pruning stale agents.")
-            raise typer.Exit(code=1)
-        console.print("  [green][OK][/green] Server not running")
-
-        # Check 2: AI agent processes
-        ai_processes = _find_ai_agent_processes()
-        if ai_processes:
-            console.print("  [red][FAIL][/red] AI agents running")
-            console.print("\n[red]Error:[/red] Found running AI agents:")
-            for name, pid in ai_processes:
-                console.print(f"  - {name} (PID {pid})")
-            console.print("\nPlease kill these processes first, or use --force to bypass.")
-            raise typer.Exit(code=1)
-        console.print("  [green][OK][/green] No AI agents detected")
-        console.print()
+        _preflight_checks("pruning stale agents")
 
     # Find stale agents
     try:
@@ -5134,6 +5132,75 @@ def doctor_prune_stale_agents(
     console.print(f"\n[green]Deleted {deleted_count} agents:[/green]")
     for proj_name, count in sorted(project_counts.items()):
         console.print(f"  - {proj_name}: {count} agent{'s' if count != 1 else ''}")
+
+
+@doctor_app.command("delete-project")
+def doctor_delete_project(
+    project: Annotated[str, typer.Argument(help="Project slug or human key to delete")],
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview without deleting"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip server/process checks"),
+    keep_storage: bool = typer.Option(False, "--keep-storage", help="Keep storage directory (only delete DB records)"),
+) -> None:
+    """Delete an entire project and all its data."""
+
+    async def _delete(pid: int) -> dict[str, int]:
+        deleted: dict[str, int] = {}
+        async with get_session() as session:
+            for stmt in [
+                "DELETE FROM message_recipients WHERE message_id IN (SELECT id FROM messages WHERE project_id = :pid)",
+                "DELETE FROM messages WHERE project_id = :pid",
+                "DELETE FROM file_reservations WHERE project_id = :pid",
+                "DELETE FROM agent_links WHERE a_project_id = :pid OR b_project_id = :pid",
+                "DELETE FROM agents WHERE project_id = :pid",
+                "DELETE FROM product_project_links WHERE project_id = :pid",
+                "DELETE FROM project_sibling_suggestions WHERE project_a_id = :pid OR project_b_id = :pid",
+                "DELETE FROM projects WHERE id = :pid",
+            ]:
+                table_name = stmt.split("FROM ")[1].split()[0]
+                result = await session.execute(text(stmt), {"pid": pid})
+                deleted[table_name] = result.rowcount or 0
+            await session.commit()
+        return deleted
+
+    # Pre-flight checks (unless --force)
+    if not force:
+        _preflight_checks("deleting a project")
+
+    # Resolve project
+    try:
+        proj = _run_async(_get_project_record(project))
+    except ValueError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    # Storage directory
+    settings = get_settings()
+    project_storage = Path(settings.storage.root).expanduser().resolve() / "projects" / proj.slug
+    storage_exists = project_storage.exists()
+
+    console.print(f"[bold {'cyan' if dry_run else 'yellow'}]{'Preview' if dry_run else 'Deleting'} project '{proj.slug}'[/bold {'cyan' if dry_run else 'yellow'}]")
+    if storage_exists:
+        console.print(f"[dim]Storage: {project_storage}{' (will be kept)' if keep_storage else ''}[/dim]")
+
+    if dry_run:
+        console.print("[yellow]No changes made. Remove --dry-run to delete.[/yellow]")
+        return
+
+    if not yes and not typer.confirm(f"Delete project '{proj.slug}' and all its data?", default=False):
+        console.print("[yellow]Cancelled.[/yellow]")
+        return
+
+    deleted = _run_async(_delete(proj.id))
+    console.print(f"[green]Deleted project '{proj.slug}':[/green] " + ", ".join(f"{k}={v}" for k, v in deleted.items() if v))
+
+    if storage_exists and not keep_storage:
+        import shutil
+        try:
+            shutil.rmtree(project_storage)
+            console.print("[dim]Storage directory removed.[/dim]")
+        except Exception as exc:
+            console.print(f"[yellow]Warning: Failed to remove storage: {exc}[/yellow]")
 
 
 if __name__ == "__main__":
