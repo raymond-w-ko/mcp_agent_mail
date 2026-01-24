@@ -2029,8 +2029,9 @@ Common variables you may set:
 | `LOG_JSON_ENABLED` | `false` | Output structlog JSON logs |
 | `MCP_AGENT_MAIL_OUTPUT_FORMAT` |  | Default output format for tools/resources (`json` or `toon`) |
 | `TOON_DEFAULT_FORMAT` |  | Global default output format fallback (`json` or `toon`) |
-| `TOON_STATS` | `false` | Emit TOON token stats (uses `tr --stats`) |
-| `TOON_TR_PATH` | `tr` | Path/command for TOON CLI encoder (default assumes `tr` on PATH) |
+| `TOON_STATS` | `false` | Emit TOON token stats (uses `tru --stats`) |
+| `TOON_TRU_BIN` |  | Explicit path/command for the `tru` encoder (overrides `TOON_BIN`) |
+| `TOON_BIN` | `tru` | Path/command for toon_rust encoder (Node `toon` is rejected) |
 | `INLINE_IMAGE_MAX_BYTES` | `65536` | Threshold (bytes) for inlining WebP images during send_message |
 | `CONVERT_IMAGES` | `true` | Convert images to WebP (and optionally inline small ones) |
 | `KEEP_ORIGINAL_IMAGES` | `false` | Also store original image bytes alongside WebP (attachments/originals/) |
