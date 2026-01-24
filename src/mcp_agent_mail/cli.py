@@ -4758,6 +4758,149 @@ def _find_ai_agent_processes() -> list[tuple[str, int]]:
     return running
 
 
+@doctor_app.command("list-agents")
+def doctor_list_agents(
+    project: Annotated[
+        Optional[str],
+        typer.Argument(help="Project slug (optional - lists all if omitted)"),
+    ] = None,
+    show_stats: bool = typer.Option(False, "--stats", "-s", help="Show message/reservation counts"),
+) -> None:
+    """List all agents, optionally filtered by project."""
+
+    async def _run() -> dict[str, Any]:
+        await ensure_schema()
+        async with get_session() as session:
+            # Resolve project if specified
+            project_id: int | None = None
+            if project:
+                proj_stmt = _sa_select(Project).where(
+                    _sa_or(Project.slug == project, Project.human_key == project)
+                )
+                proj_result = await session.execute(proj_stmt)
+                proj_obj = proj_result.scalar_one_or_none()
+                if not proj_obj:
+                    return {"error": f"Project not found: {project}"}
+                project_id = proj_obj.id
+
+            # Build query
+            stmt = _sa_select(Agent).order_by(Agent.project_id, Agent.name)
+            if project_id:
+                stmt = stmt.where(Agent.project_id == project_id)
+
+            result = await session.execute(stmt)
+            agents = list(result.scalars().all())
+
+            # Collect project info
+            if agents:
+                proj_ids = {a.project_id for a in agents}
+                proj_stmt = _sa_select(Project).where(Project.id.in_(proj_ids))
+                proj_result = await session.execute(proj_stmt)
+                projects_by_id = {p.id: p for p in proj_result.scalars().all()}
+            else:
+                projects_by_id = {}
+
+            # Optionally gather stats
+            agent_stats: dict[int, dict[str, int]] = {}
+            if show_stats and agents:
+                agent_ids = [a.id for a in agents]
+
+                # Count sent messages
+                sent_stmt = (
+                    _sa_select(Message.sender_id, func.count(Message.id))
+                    .where(Message.sender_id.in_(agent_ids))
+                    .group_by(Message.sender_id)
+                )
+                sent_result = await session.execute(sent_stmt)
+                for sender_id, count in sent_result:
+                    if sender_id not in agent_stats:
+                        agent_stats[sender_id] = {"sent": 0, "received": 0, "reservations": 0}
+                    agent_stats[sender_id]["sent"] = count
+
+                # Count received messages
+                recv_stmt = (
+                    _sa_select(MessageRecipient.agent_id, func.count(MessageRecipient.message_id))
+                    .where(MessageRecipient.agent_id.in_(agent_ids))
+                    .group_by(MessageRecipient.agent_id)
+                )
+                recv_result = await session.execute(recv_stmt)
+                for agent_id, count in recv_result:
+                    if agent_id not in agent_stats:
+                        agent_stats[agent_id] = {"sent": 0, "received": 0, "reservations": 0}
+                    agent_stats[agent_id]["received"] = count
+
+                # Count active reservations
+                res_stmt = (
+                    _sa_select(FileReservation.agent_id, func.count(FileReservation.id))
+                    .where(
+                        FileReservation.agent_id.in_(agent_ids),
+                        FileReservation.released_ts.is_(None),
+                    )
+                    .group_by(FileReservation.agent_id)
+                )
+                res_result = await session.execute(res_stmt)
+                for agent_id, count in res_result:
+                    if agent_id not in agent_stats:
+                        agent_stats[agent_id] = {"sent": 0, "received": 0, "reservations": 0}
+                    agent_stats[agent_id]["reservations"] = count
+
+            return {
+                "agents": agents,
+                "projects_by_id": projects_by_id,
+                "agent_stats": agent_stats,
+            }
+
+    try:
+        result = _run_async(_run())
+    except Exception as exc:
+        console.print(f"[red]Error listing agents:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if "error" in result:
+        console.print(f"[red]Error:[/red] {result['error']}")
+        raise typer.Exit(code=1)
+
+    agents = result["agents"]
+    projects_by_id = result["projects_by_id"]
+    agent_stats = result["agent_stats"]
+
+    if not agents:
+        console.print("[yellow]No agents found.[/yellow]")
+        return
+
+    table = Table()
+    table.add_column("ID", style="dim")
+    table.add_column("Name")
+    table.add_column("Project")
+    table.add_column("Program")
+    table.add_column("Created")
+    if show_stats:
+        table.add_column("Sent", justify="right")
+        table.add_column("Recv", justify="right")
+        table.add_column("Res", justify="right")
+
+    for agent in agents:
+        proj = projects_by_id.get(agent.project_id)
+        proj_name = proj.slug if proj else f"(id={agent.project_id})"
+        created_str = agent.inception_ts.strftime("%Y-%m-%d %H:%M") if agent.inception_ts else "unknown"
+
+        row = [
+            str(agent.id),
+            agent.name,
+            proj_name,
+            agent.program or "",
+            created_str,
+        ]
+        if show_stats:
+            stats = agent_stats.get(agent.id, {"sent": 0, "received": 0, "reservations": 0})
+            row.extend([str(stats["sent"]), str(stats["received"]), str(stats["reservations"])])
+
+        table.add_row(*row)
+
+    console.print(f"\n[bold]Agents ({len(agents)} total)[/bold]\n")
+    console.print(table)
+
+
 @doctor_app.command("prune-stale-agents")
 def doctor_prune_stale_agents(
     project: Annotated[
