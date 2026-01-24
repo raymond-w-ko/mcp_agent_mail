@@ -4964,36 +4964,29 @@ def doctor_prune_stale_agents(
             result = await session.execute(stmt)
             all_stale_agents = list(result.scalars().all())
 
-            # Filter to only keep the most recent Program per project
-            # Group stale agents by project_id and find the most recent Program for each
+            # For each (project, program) pair, keep only the most recent agent
+            # Group stale agents by (project_id, program)
             from collections import defaultdict
 
-            by_project: dict[int, list[Any]] = defaultdict(list)
+            by_project_program: dict[tuple[int, str | None], list[Any]] = defaultdict(list)
             for agent in all_stale_agents:
-                by_project[agent.project_id].append(agent)
+                key = (agent.project_id, agent.program)
+                by_project_program[key].append(agent)
 
             stale_agents: list[Any] = []
-            for proj_id, agents in by_project.items():
-                # Find the most recent Program value by max inception_ts
-                # Group by program and find max inception_ts for each program
-                program_max_ts: dict[str | None, Any] = {}
-                for agent in agents:
-                    prog = agent.program
-                    ts = agent.inception_ts
-                    if prog not in program_max_ts or (ts and (program_max_ts[prog] is None or ts > program_max_ts[prog])):
-                        program_max_ts[prog] = ts
-
-                # Find the most recent program (the one with the latest max timestamp)
-                most_recent_program = None
+            for (proj_id, program), agents in by_project_program.items():
+                # Find the most recent agent by inception_ts
+                most_recent_agent = None
                 most_recent_ts = None
-                for prog, ts in program_max_ts.items():
+                for agent in agents:
+                    ts = agent.inception_ts
                     if most_recent_ts is None or (ts is not None and ts > most_recent_ts):
-                        most_recent_program = prog
+                        most_recent_agent = agent
                         most_recent_ts = ts
 
-                # Only include agents that don't have the most recent program
+                # Include all agents except the most recent one
                 for agent in agents:
-                    if agent.program != most_recent_program:
+                    if agent.id != most_recent_agent.id:
                         stale_agents.append(agent)
 
             # Collect project info for display
