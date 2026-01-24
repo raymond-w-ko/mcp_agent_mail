@@ -4819,7 +4819,39 @@ def doctor_prune_stale_agents(
             # Join with Project for display
             stmt = stmt.order_by(Agent.project_id, Agent.name)
             result = await session.execute(stmt)
-            stale_agents = list(result.scalars().all())
+            all_stale_agents = list(result.scalars().all())
+
+            # Filter to only keep the most recent Program per project
+            # Group stale agents by project_id and find the most recent Program for each
+            from collections import defaultdict
+
+            by_project: dict[int, list[Any]] = defaultdict(list)
+            for agent in all_stale_agents:
+                by_project[agent.project_id].append(agent)
+
+            stale_agents: list[Any] = []
+            for proj_id, agents in by_project.items():
+                # Find the most recent Program value by max inception_ts
+                # Group by program and find max inception_ts for each program
+                program_max_ts: dict[str | None, Any] = {}
+                for agent in agents:
+                    prog = agent.program
+                    ts = agent.inception_ts
+                    if prog not in program_max_ts or (ts and (program_max_ts[prog] is None or ts > program_max_ts[prog])):
+                        program_max_ts[prog] = ts
+
+                # Find the most recent program (the one with the latest max timestamp)
+                most_recent_program = None
+                most_recent_ts = None
+                for prog, ts in program_max_ts.items():
+                    if most_recent_ts is None or (ts is not None and ts > most_recent_ts):
+                        most_recent_program = prog
+                        most_recent_ts = ts
+
+                # Only include agents that don't have the most recent program
+                for agent in agents:
+                    if agent.program != most_recent_program:
+                        stale_agents.append(agent)
 
             # Collect project info for display
             if stale_agents:
