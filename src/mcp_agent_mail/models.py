@@ -88,12 +88,14 @@ class Message(SQLModel, table=True):
     __table_args__ = (
         Index("idx_messages_project_created", "project_id", "created_ts"),
         Index("idx_messages_project_sender_created", "project_id", "sender_id", "created_ts"),
+        Index("idx_messages_project_topic", "project_id", "topic"),
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
     project_id: int = Field(foreign_key="projects.id", index=True)
     sender_id: int = Field(foreign_key="agents.id", index=True)
     thread_id: Optional[str] = Field(default=None, index=True, max_length=128)
+    topic: Optional[str] = Field(default=None, max_length=64)
     subject: str = Field(max_length=512)
     body_md: str
     importance: str = Field(default="normal", max_length=16)
@@ -142,6 +144,49 @@ class AgentLink(SQLModel, table=True):
     created_ts: datetime = Field(default_factory=_utcnow_naive)
     updated_ts: datetime = Field(default_factory=_utcnow_naive)
     expires_ts: Optional[datetime] = None
+
+
+class WindowIdentity(SQLModel, table=True):
+    """Persistent window-based agent identity tied to a tmux/terminal window.
+
+    Agents that share the same window_uuid within a project share a persistent
+    identity that survives session restarts, eliminating per-session registration
+    overhead and enabling tracking of which window/pane is doing what.
+    """
+
+    __tablename__ = "window_identities"
+    __table_args__ = (
+        UniqueConstraint("project_id", "window_uuid", name="uq_window_identity_project_uuid"),
+        Index("idx_window_identities_project_active", "project_id", "expires_ts"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="projects.id", index=True)
+    window_uuid: str = Field(max_length=64, index=True)
+    display_name: str = Field(max_length=128)
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+    last_active_ts: datetime = Field(default_factory=_utcnow_naive)
+    expires_ts: Optional[datetime] = Field(default=None)
+
+
+class MessageSummary(SQLModel, table=True):
+    """Stored on-demand project-wide message summary."""
+
+    __tablename__ = "message_summaries"
+    __table_args__ = (
+        Index("idx_summaries_project_end", "project_id", "end_ts"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="projects.id", index=True)
+    summary_text: str
+    start_ts: datetime
+    end_ts: datetime
+    source_message_count: int = Field(default=0)
+    source_thread_ids: str = Field(default="[]")  # JSON array of thread IDs
+    llm_model: Optional[str] = Field(default=None, max_length=128)
+    cost_usd: Optional[float] = Field(default=None)
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
 
 
 class ProjectSiblingSuggestion(SQLModel, table=True):

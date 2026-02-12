@@ -400,7 +400,7 @@ def _build_engine(settings: DatabaseSettings) -> AsyncEngine:
         pool_size=pool_size,
         max_overflow=max_overflow,
         pool_timeout=pool_timeout,  # Extended timeout for SQLite checkpoint scenarios
-        pool_recycle=1800,  # Recycle connections every 30 minutes (was 1 hour)
+        pool_recycle=600,  # Recycle connections every 10 minutes to prevent stale handle buildup under sustained load
         pool_reset_on_return="rollback",  # Ensure uncommitted transactions are rolled back on return
         connect_args=connect_args,
     )
@@ -791,6 +791,34 @@ def _setup_fts(connection: Any) -> None:
     connection.exec_driver_sql(
         "CREATE INDEX IF NOT EXISTS idx_agent_links_status "
         "ON agent_links(status)"
+    )
+    # Migration: add topic column to messages table (bd-26w broadcast topics)
+    try:
+        connection.exec_driver_sql("ALTER TABLE messages ADD COLUMN topic TEXT DEFAULT NULL")
+    except Exception:
+        pass  # Column already exists
+    connection.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS idx_messages_project_topic ON messages(project_id, topic)"
+    )
+    # Migration: create message_summaries table (bd-1ia on-demand summarization)
+    connection.exec_driver_sql(
+        """
+        CREATE TABLE IF NOT EXISTS message_summaries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL REFERENCES projects(id),
+            summary_text TEXT NOT NULL,
+            start_ts TIMESTAMP NOT NULL,
+            end_ts TIMESTAMP NOT NULL,
+            source_message_count INTEGER NOT NULL DEFAULT 0,
+            source_thread_ids TEXT NOT NULL DEFAULT '[]',
+            llm_model TEXT,
+            cost_usd REAL,
+            created_ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    connection.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS idx_summaries_project_end ON message_summaries(project_id, end_ts)"
     )
 
 

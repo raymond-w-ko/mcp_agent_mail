@@ -53,10 +53,12 @@ from .models import (
     FileReservation,
     Message,
     MessageRecipient,
+    MessageSummary,
     Project,
     ProjectSiblingSuggestion,
     Product,
     ProductProjectLink,
+    WindowIdentity,
 )
 from .storage import (
     GitIndexLockError,
@@ -1199,16 +1201,28 @@ class FileReservationStatus:
 
 _GLOB_MARKERS: tuple[str, ...] = ("*", "?", "[")
 
+# Virtual namespace prefixes for non-filesystem reservations (bd-14z)
+_VIRTUAL_NS_PREFIXES: tuple[str, ...] = ("tool://", "resource://", "service://")
+
+
+def _is_virtual_namespace(pattern: str) -> bool:
+    """Check if a reservation pattern uses a virtual namespace (not a filesystem path)."""
+    return any(pattern.startswith(prefix) for prefix in _VIRTUAL_NS_PREFIXES)
+
 
 def _contains_glob(pattern: str) -> bool:
     return any(marker in pattern for marker in _GLOB_MARKERS)
 
 
 def _normalize_pattern(pattern: str) -> str:
+    if _is_virtual_namespace(pattern):
+        return pattern.strip()
     return pattern.lstrip("/").strip()
 
 
 def _collect_matching_paths(base: Path, pattern: str) -> list[Path]:
+    if _is_virtual_namespace(pattern):
+        return []  # Virtual namespaces have no filesystem presence
     if not base.exists():
         return []
     normalized = _normalize_pattern(pattern)
@@ -1659,6 +1673,7 @@ def _message_to_dict(message: Message, include_body: bool = True) -> dict[str, A
         "project_id": message.project_id,
         "sender_id": message.sender_id,
         "thread_id": message.thread_id,
+        "topic": message.topic,
         "subject": message.subject,
         "importance": message.importance,
         "ack_required": message.ack_required,
@@ -2398,6 +2413,10 @@ def _detect_suspicious_file_reservation(pattern: str) -> str | None:
     """
     p = pattern.strip()
 
+    # Virtual namespace patterns are always valid (bd-14z)
+    if _is_virtual_namespace(p):
+        return None
+
     # Catch overly broad patterns
     if p in ("*", "**", "**/*", "**/**", "."):
         return (
@@ -2805,6 +2824,90 @@ async def _agent_name_exists(project: Project, name: str) -> bool:
         return result.first() is not None
 
 
+async def _get_window_identity(
+    project: Project,
+    window_uuid: str,
+) -> Optional[WindowIdentity]:
+    """Look up an existing, non-expired window identity."""
+    if project.id is None:
+        return None
+    await ensure_schema()
+    now = _naive_utc()
+    async with get_session() as session:
+        result = await session.execute(
+            select(WindowIdentity).where(
+                cast(Any, WindowIdentity.project_id == project.id),
+                cast(Any, func.lower(WindowIdentity.window_uuid) == window_uuid.lower()),
+                cast(Any, or_(WindowIdentity.expires_ts.is_(None), WindowIdentity.expires_ts > now)),
+            )
+        )
+        return result.scalars().first()
+
+
+async def _create_window_identity(
+    project: Project,
+    window_uuid: str,
+    display_name: str,
+    ttl_days: int = 30,
+) -> WindowIdentity:
+    """Create a new window identity record.
+
+    Handles concurrent creation gracefully: if another caller inserts the same
+    (project_id, window_uuid) first, we catch the IntegrityError and return
+    the existing record instead of crashing.
+    """
+    if project.id is None:
+        raise ValueError("Project must have an id before creating window identities.")
+    await ensure_schema()
+    now = _naive_utc()
+    expires = now + timedelta(days=ttl_days)
+    async with get_session() as session:
+        identity = WindowIdentity(
+            project_id=project.id,
+            window_uuid=window_uuid,
+            display_name=display_name,
+            created_ts=now,
+            last_active_ts=now,
+            expires_ts=expires,
+        )
+        session.add(identity)
+        try:
+            await session.commit()
+            await session.refresh(identity)
+            return identity
+        except IntegrityError:
+            await session.rollback()
+            # Concurrent insert won the race — fetch the existing record
+            existing = await _get_window_identity(project, window_uuid)
+            if existing is not None:
+                return existing
+            raise  # Should not happen, but don't swallow unexpected errors
+
+
+async def _touch_window_identity(
+    identity: WindowIdentity,
+    ttl_days: int = 30,
+) -> None:
+    """Update last_active_ts and extend expiry for a window identity."""
+    now = _naive_utc()
+    async with get_session() as session:
+        db_identity = await session.get(WindowIdentity, identity.id)
+        if db_identity:
+            db_identity.last_active_ts = now
+            db_identity.expires_ts = now + timedelta(days=ttl_days)
+            session.add(db_identity)
+            await session.commit()
+
+
+def _validate_window_uuid(value: str) -> bool:
+    """Validate that a string looks like a UUID."""
+    try:
+        uuid.UUID(value)
+        return True
+    except (ValueError, AttributeError):
+        return False
+
+
 async def _generate_unique_agent_name(
     project: Project,
     settings: Settings,
@@ -2886,9 +2989,20 @@ async def _get_or_create_agent(
         raise ValueError("Project must have an id before creating agents.")
     mode = getattr(settings, "agent_name_enforcement_mode", "coerce").lower()
     explicit_name_used = False
-    if mode == "always_auto" or name is None:
+    window_uuid = getattr(settings, "window_identity_uuid", "") or ""
+    ttl_days = getattr(settings, "window_identity_ttl_days", 30)
+    window_identity: Optional[WindowIdentity] = None
+
+    # Priority chain per bead bd-1tz:
+    # 1. Explicit agent_name parameter -> use as-is (highest priority)
+    # 2. MCP_AGENT_MAIL_WINDOW_ID set + window identity exists -> use window display_name
+    # 3. MCP_AGENT_MAIL_WINDOW_ID set + window identity NOT in DB -> create new, use generated name
+    # 4. No window ID, no explicit name -> auto-generate (current behavior)
+
+    if mode == "always_auto" and not window_uuid:
         desired_name = await _generate_unique_agent_name(project, settings, None)
-    else:
+    elif name is not None and mode != "always_auto":
+        # Priority 1: Explicit name provided
         sanitized = sanitize_agent_name(name)
         if not sanitized:
             if mode == "strict":
@@ -2900,7 +3014,6 @@ async def _get_or_create_agent(
                 explicit_name_used = True
             else:
                 if mode == "strict":
-                    # Check for common mistakes and provide specific guidance
                     mistake = _detect_agent_name_mistake(sanitized)
                     if mistake:
                         raise ToolExecutionError(
@@ -2918,8 +3031,28 @@ async def _get_or_create_agent(
                         recoverable=True,
                         data={"provided_name": sanitized, "valid_examples": ["BlueLake", "GreenCastle", "RedStone"]},
                     )
-                # coerce -> ignore invalid provided name and auto-generate
                 desired_name = await _generate_unique_agent_name(project, settings, None)
+    elif window_uuid:
+        # Priority 2/3: Window identity resolution
+        if not _validate_window_uuid(window_uuid):
+            logger.warning("MCP_AGENT_MAIL_WINDOW_ID is not a valid UUID: %s", window_uuid)
+            desired_name = await _generate_unique_agent_name(project, settings, None)
+        else:
+            window_identity = await _get_window_identity(project, window_uuid)
+            if window_identity:
+                # Priority 2: existing window identity -> reuse its display_name
+                desired_name = window_identity.display_name
+                explicit_name_used = True  # treat as explicit to avoid collision retries
+                await _touch_window_identity(window_identity, ttl_days)
+            else:
+                # Priority 3: new window identity -> generate name and create identity
+                desired_name = await _generate_unique_agent_name(project, settings, None)
+                window_identity = await _create_window_identity(
+                    project, window_uuid, desired_name, ttl_days,
+                )
+    else:
+        # Priority 4: no name, no window ID -> auto-generate
+        desired_name = await _generate_unique_agent_name(project, settings, None)
     await ensure_schema()
     async with get_session() as session:
         for _attempt in range(5):
@@ -2984,9 +3117,27 @@ async def _get_or_create_agent(
                 continue
         else:
             raise RuntimeError("Failed to create a unique agent after multiple retries.")
+    # Post-creation: associate explicit-name agents with window identity and
+    # enrich the archive profile.  We consolidate into a single block to avoid
+    # redundant DB lookups (window_identity may already be set from the
+    # priority-chain resolution above).
+    if window_uuid and _validate_window_uuid(window_uuid) and window_identity is None and explicit_name_used:
+        # Explicit name was used with a window UUID — look up / create association
+        window_identity = await _get_window_identity(project, window_uuid)
+        if window_identity is None:
+            window_identity = await _create_window_identity(
+                project, window_uuid, agent.name, ttl_days,
+            )
+        else:
+            await _touch_window_identity(window_identity, ttl_days)
+
     archive = await ensure_archive(settings, project.slug)
+    agent_dict = _agent_to_dict(agent)
+    if window_identity is not None:
+        agent_dict["window_id"] = window_identity.window_uuid
+        agent_dict["window_display_name"] = window_identity.display_name
     async with _archive_write_lock(archive):
-        await write_agent_profile(archive, _agent_to_dict(agent))
+        await write_agent_profile(archive, agent_dict)
     return agent
 
 
@@ -3197,6 +3348,7 @@ async def _create_message(
     ack_required: bool,
     thread_id: Optional[str],
     attachments: Sequence[dict[str, Any]],
+    topic: Optional[str] = None,
 ) -> Message:
     if project.id is None:
         raise ValueError("Project must have an id before creating messages.")
@@ -3212,6 +3364,7 @@ async def _create_message(
             importance=importance,
             ack_required=ack_required,
             thread_id=thread_id,
+            topic=topic,
             attachments=list(attachments),
         )
         session.add(message)
@@ -3563,6 +3716,14 @@ def _file_reservations_conflict(existing: FileReservation, candidate_path: str, 
         return False
     if not existing.exclusive and not candidate_exclusive:
         return False
+    # Virtual namespace reservations use exact-match only (bd-14z)
+    candidate_virtual = _is_virtual_namespace(candidate_path)
+    existing_virtual = _is_virtual_namespace(existing.path_pattern)
+    if candidate_virtual or existing_virtual:
+        # Virtual vs filesystem never conflict; virtual vs virtual = exact match
+        if candidate_virtual != existing_virtual:
+            return False
+        return candidate_path.strip() == existing.path_pattern.strip()
     # Git wildmatch semantics; treat inputs as repo-root relative forward-slash paths
     def _normalize(p: str) -> str:
         return p.replace("\\", "/").lstrip("/")
@@ -3583,6 +3744,8 @@ def _file_reservations_conflict(existing: FileReservation, candidate_path: str, 
 
 def _normalize_pathspec_pattern(pattern: str) -> str:
     """Normalize a pattern for PathSpec caching (slash normalization + leading slash strip)."""
+    if _is_virtual_namespace(pattern):
+        return pattern  # Preserve virtual namespace scheme
     return pattern.replace("\\", "/").lstrip("/")
 
 
@@ -3684,6 +3847,9 @@ def _build_reservation_union_spec(
         # Skip non-exclusive if candidate is also non-exclusive
         if not record.exclusive and not candidate_exclusive:
             continue
+        # Skip virtual namespace patterns (they use exact-match, not pathspec) (bd-14z)
+        if _is_virtual_namespace(record.path_pattern):
+            continue
         # Add normalized pattern
         patterns.append(_normalize_pathspec_pattern(record.path_pattern))
 
@@ -3701,6 +3867,7 @@ async def _list_inbox(
     urgent_only: bool,
     include_bodies: bool,
     since_ts: Optional[str],
+    topic: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     if project.id is None or agent.id is None:
         raise ValueError("Project and agent must have ids before listing inbox.")
@@ -3724,6 +3891,8 @@ async def _list_inbox(
             since_dt = _parse_iso(since_ts)
             if since_dt:
                 stmt = stmt.where(Message.created_ts > _naive_utc(since_dt))
+        if topic:
+            stmt = stmt.where(cast(Any, func.lower(Message.topic)) == topic.lower())
         result = await session.execute(stmt)
         rows = result.all()
     messages: list[dict[str, Any]] = []
@@ -4158,6 +4327,7 @@ def build_mcp_server() -> FastMCP:
         importance: str,
         ack_required: bool,
         thread_id: Optional[str],
+        topic: Optional[str] = None,
     ) -> dict[str, Any]:
         # Re-fetch settings at call time so tests that mutate env + clear cache take effect
         settings = get_settings()
@@ -4301,6 +4471,7 @@ def build_mcp_server() -> FastMCP:
                 ack_required,
                 thread_id,
                 attachments_meta,
+                topic=topic,
             )
             frontmatter = _message_frontmatter(
                 message,
@@ -4322,6 +4493,13 @@ def build_mcp_server() -> FastMCP:
                     "attachments": attachments_meta,
                 }
             )
+            # Enrich payload with sender's window identity if available
+            _wi_uuid = getattr(settings, "window_identity_uuid", "") or ""
+            if _wi_uuid and _validate_window_uuid(_wi_uuid):
+                _wi = await _get_window_identity(project, _wi_uuid)
+                if _wi:
+                    payload["window_id"] = _wi.window_uuid
+                    payload["window_display_name"] = _wi.display_name
             result_snapshot: dict[str, Any] = {
                 "deliveries": [
                     {
@@ -4617,7 +4795,17 @@ def build_mcp_server() -> FastMCP:
                     await session.refresh(db_agent)
                     agent = db_agent
         await ctx.info(f"Registered agent '{agent.name}' for project '{project.human_key}'.")
-        return _agent_to_dict(agent)
+        result = _agent_to_dict(agent)
+        # Enrich with window identity info if MCP_AGENT_MAIL_WINDOW_ID is set.
+        # NOTE: _get_or_create_agent already resolved this for the archive profile,
+        # but propagating it via return type would churn 8+ callers for a cold-path query.
+        window_uuid = getattr(settings, "window_identity_uuid", "") or ""
+        if window_uuid and _validate_window_uuid(window_uuid):
+            wi = await _get_window_identity(project, window_uuid)
+            if wi:
+                result["window_id"] = wi.window_uuid
+                result["window_display_name"] = wi.display_name
+        return result
 
     @mcp.tool(name="whois")
     @_instrument_tool("whois", cluster=CLUSTER_IDENTITY, capabilities={"identity", "audit"}, project_arg="project_key", agent_arg="agent_name")
@@ -4755,6 +4943,200 @@ def build_mcp_server() -> FastMCP:
         await ctx.info(f"Created new agent identity '{agent.name}' for project '{project.human_key}'.")
         return _agent_to_dict(agent)
 
+    @mcp.tool(name="list_window_identities")
+    @_instrument_tool(
+        "list_window_identities",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity"},
+        project_arg="project_key",
+        complexity="low",
+    )
+    async def list_window_identities(
+        ctx: Context,
+        project_key: str,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        List active window identities for a project.
+
+        Returns all non-expired window identities with their display names,
+        last activity timestamps, and age.
+
+        Parameters
+        ----------
+        project_key : str
+            Project identifier.
+
+        Returns
+        -------
+        dict
+            { identities: [{ id, window_uuid, display_name, created_ts, last_active_ts, expires_ts }] }
+        """
+        project = await _get_project_by_identifier(project_key)
+        await ensure_schema()
+        now = _naive_utc()
+        async with get_session() as session:
+            result = await session.execute(
+                select(WindowIdentity).where(
+                    cast(Any, WindowIdentity.project_id == project.id),
+                    cast(Any, or_(WindowIdentity.expires_ts.is_(None), WindowIdentity.expires_ts > now)),
+                )
+            )
+            identities = result.scalars().all()
+        items = []
+        for wi in identities:
+            items.append({
+                "id": wi.id,
+                "window_uuid": wi.window_uuid,
+                "display_name": wi.display_name,
+                "created_ts": _iso(wi.created_ts),
+                "last_active_ts": _iso(wi.last_active_ts),
+                "expires_ts": _iso(wi.expires_ts) if wi.expires_ts else None,
+                "age_days": (now - wi.created_ts).days if wi.created_ts else None,
+            })
+        return {"identities": items, "count": len(items)}
+
+    @mcp.tool(name="rename_window")
+    @_instrument_tool(
+        "rename_window",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity", "write"},
+        project_arg="project_key",
+    )
+    async def rename_window(
+        ctx: Context,
+        project_key: str,
+        window_uuid: str,
+        new_display_name: str,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Update the display name of a window identity.
+
+        Parameters
+        ----------
+        project_key : str
+            Project identifier.
+        window_uuid : str
+            The UUID of the window identity to rename.
+        new_display_name : str
+            New display name (must be a valid adjective+noun agent name).
+
+        Returns
+        -------
+        dict
+            Updated window identity record.
+        """
+        if not _validate_window_uuid(window_uuid):
+            raise ToolExecutionError(
+                "INVALID_WINDOW_UUID",
+                f"Invalid window UUID format: '{window_uuid}'.",
+                recoverable=True,
+            )
+        sanitized = sanitize_agent_name(new_display_name)
+        if not sanitized or not validate_agent_name_format(sanitized):
+            raise ToolExecutionError(
+                "INVALID_DISPLAY_NAME",
+                f"Display name must be a valid adjective+noun combination (e.g., 'BlueLake'). Got: '{new_display_name}'.",
+                recoverable=True,
+            )
+        project = await _get_project_by_identifier(project_key)
+        await ensure_schema()
+        now = _naive_utc()
+        async with get_session() as session:
+            result = await session.execute(
+                select(WindowIdentity).where(
+                    cast(Any, WindowIdentity.project_id == project.id),
+                    cast(Any, func.lower(WindowIdentity.window_uuid) == window_uuid.lower()),
+                    cast(Any, or_(WindowIdentity.expires_ts.is_(None), WindowIdentity.expires_ts > now)),
+                )
+            )
+            wi = result.scalars().first()
+            if not wi:
+                raise ToolExecutionError(
+                    "WINDOW_NOT_FOUND",
+                    f"No active window identity found for UUID '{window_uuid}'.",
+                    recoverable=True,
+                )
+            old_name = wi.display_name
+            wi.display_name = sanitized
+            wi.last_active_ts = now
+            session.add(wi)
+            await session.commit()
+            await session.refresh(wi)
+        await ctx.info(f"Renamed window '{window_uuid}' from '{old_name}' to '{sanitized}'.")
+        return {
+            "id": wi.id,
+            "window_uuid": wi.window_uuid,
+            "display_name": wi.display_name,
+            "old_display_name": old_name,
+            "last_active_ts": _iso(wi.last_active_ts),
+        }
+
+    @mcp.tool(name="expire_window")
+    @_instrument_tool(
+        "expire_window",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity", "write"},
+        project_arg="project_key",
+    )
+    async def expire_window(
+        ctx: Context,
+        project_key: str,
+        window_uuid: str,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Mark a window identity as expired.
+
+        Parameters
+        ----------
+        project_key : str
+            Project identifier.
+        window_uuid : str
+            The UUID of the window identity to expire.
+
+        Returns
+        -------
+        dict
+            { window_uuid, expired: bool, expired_at }
+        """
+        if not _validate_window_uuid(window_uuid):
+            raise ToolExecutionError(
+                "INVALID_WINDOW_UUID",
+                f"Invalid window UUID format: '{window_uuid}'.",
+                recoverable=True,
+            )
+        project = await _get_project_by_identifier(project_key)
+        await ensure_schema()
+        now = _naive_utc()
+        async with get_session() as session:
+            result = await session.execute(
+                select(WindowIdentity).where(
+                    cast(Any, WindowIdentity.project_id == project.id),
+                    cast(Any, func.lower(WindowIdentity.window_uuid) == window_uuid.lower()),
+                    cast(Any, or_(WindowIdentity.expires_ts.is_(None), WindowIdentity.expires_ts > now)),
+                )
+            )
+            wi = result.scalars().first()
+            if not wi:
+                raise ToolExecutionError(
+                    "WINDOW_NOT_FOUND",
+                    f"No active window identity found for UUID '{window_uuid}'.",
+                    recoverable=True,
+                )
+            wi.expires_ts = now
+            session.add(wi)
+            await session.commit()
+            await session.refresh(wi)
+        await ctx.info(f"Expired window identity '{wi.display_name}' ({window_uuid}).")
+        return {
+            "window_uuid": wi.window_uuid,
+            "display_name": wi.display_name,
+            "expired": True,
+            "expired_at": _iso(now),
+        }
+
     @mcp.tool(name="send_message")
     @_instrument_tool(
         "send_message",
@@ -4777,6 +5159,8 @@ def build_mcp_server() -> FastMCP:
         importance: str = "normal",
         ack_required: bool = False,
         thread_id: Optional[str] = None,
+        broadcast: bool = False,
+        topic: Optional[str] = None,
         auto_contact_if_blocked: bool = False,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
@@ -4821,6 +5205,13 @@ def build_mcp_server() -> FastMCP:
             If true, recipients should call `acknowledge_message` after reading.
         thread_id : Optional[str]
             If provided, message will be associated with an existing thread.
+        broadcast : bool
+            If true and `to` is empty, expand recipients to all registered agents in the
+            project (excluding the sender). Mutually exclusive with explicit `to` recipients.
+            Respects contact_policy settings — agents with block_all are skipped.
+        topic : Optional[str]
+            Optional topic tag (alphanumeric + hyphens, max 64 chars). Stored on the message
+            for topic-based filtering via fetch_inbox(topic=...) or fetch_topic().
 
         Returns
         -------
@@ -4877,6 +5268,47 @@ def build_mcp_server() -> FastMCP:
         ```
         """
         project = await _get_project_by_identifier(project_key)
+
+        # Validate topic format if provided
+        if topic is not None:
+            import re as _re
+            topic = topic.strip()
+            if not topic or len(topic) > 64 or not _re.fullmatch(r"[A-Za-z0-9_-]+", topic):
+                raise ToolExecutionError(
+                    "INVALID_TOPIC",
+                    f"Topic must be 1-64 alphanumeric/hyphen/underscore characters. Got: {topic!r}",
+                    recoverable=True,
+                    data={"argument": "topic", "provided": topic},
+                )
+
+        # Broadcast expansion: expand to = all agents in project (excluding sender)
+        if broadcast:
+            if to and any(t.strip() for t in to):
+                raise ToolExecutionError(
+                    "INVALID_ARGUMENT",
+                    "broadcast=true and explicit 'to' recipients are mutually exclusive. "
+                    "Set broadcast=true with an empty 'to' list, or provide explicit recipients without broadcast.",
+                    recoverable=True,
+                    data={"argument": "broadcast"},
+                )
+            await ensure_schema()
+            async with get_session() as _bcast_session:
+                _bcast_cutoff = _naive_utc() - timedelta(days=30)
+                _bcast_result = await _bcast_session.execute(
+                    select(Agent.name, Agent.contact_policy).where(
+                        cast(Any, Agent.project_id == project.id),
+                        cast(Any, Agent.last_active_ts > _bcast_cutoff),
+                    )
+                )
+                _bcast_rows = _bcast_result.all()
+            sender_lower = sender_name.lower().strip()
+            to = [
+                row[0] for row in _bcast_rows
+                if row[0].lower() != sender_lower
+                and (row[1] or "auto").lower() != "block_all"
+            ]
+            if not to:
+                await ctx.info("[warn] Broadcast: no eligible recipients found (sender is the only active agent).")
 
         # Normalize 'to' parameter - accept single string and convert to list
         if isinstance(to, str):
@@ -5642,6 +6074,7 @@ def build_mcp_server() -> FastMCP:
                 importance,
                 ack_required,
                 thread_id,
+                topic=topic,
             )
             deliveries.append({"project": project.human_key, "payload": payload_local})
         # External per-target project deliver (requires aliasing sender in target project)
@@ -5664,6 +6097,7 @@ def build_mcp_server() -> FastMCP:
                     importance,
                     ack_required,
                     thread_id,
+                    topic=topic,
                 )
                 deliveries.append({"project": p.human_key, "payload": payload_ext})
             except Exception:
@@ -5881,6 +6315,7 @@ def build_mcp_server() -> FastMCP:
                 importance=original.importance,
                 ack_required=original.ack_required,
                 thread_id=thread_key,
+                topic=original.topic,
             )
             deliveries.append({"project": project.human_key, "payload": payload_local})
 
@@ -5910,6 +6345,7 @@ def build_mcp_server() -> FastMCP:
                     importance=original.importance,
                     ack_required=original.ack_required,
                     thread_id=thread_key,
+                    topic=original.topic,
                 )
                 deliveries.append({"project": target_project.human_key, "payload": payload_ext})
             except Exception:
@@ -6254,6 +6690,7 @@ def build_mcp_server() -> FastMCP:
         urgent_only: bool = False,
         include_bodies: bool = False,
         since_ts: Optional[str] = None,
+        topic: Optional[str] = None,
         format: Optional[str] = None,
     ) -> list[dict[str, Any]]:
         """
@@ -6265,6 +6702,7 @@ def build_mcp_server() -> FastMCP:
         - `since_ts`: ISO-8601 timestamp string; messages strictly newer than this are returned
         - `limit`: max number of messages (default 20)
         - `include_bodies`: include full Markdown bodies in the payloads
+        - `topic`: filter to messages with this topic tag
 
         Usage patterns
         --------------
@@ -6314,7 +6752,7 @@ def build_mcp_server() -> FastMCP:
         try:
             project = await _get_project_by_identifier(project_key)
             agent = await _get_agent(project, agent_name)
-            items = await _list_inbox(project, agent, limit, urgent_only, include_bodies, since_ts)
+            items = await _list_inbox(project, agent, limit, urgent_only, include_bodies, since_ts, topic=topic)
             if settings.notifications.enabled:
                 with suppress(Exception):
                     await clear_notification_signal(settings, project.slug, agent.name)
@@ -6323,6 +6761,83 @@ def build_mcp_server() -> FastMCP:
         except Exception as exc:
             _rich_error_panel("fetch_inbox", {"error": str(exc)})
             raise
+
+    @mcp.tool(name="fetch_topic")
+    @_instrument_tool(
+        "fetch_topic",
+        cluster=CLUSTER_MESSAGING,
+        capabilities={"messaging", "read"},
+        project_arg="project_key",
+    )
+    async def fetch_topic(
+        ctx: Context,
+        project_key: str,
+        topic_name: str,
+        limit: int = 50,
+        include_bodies: bool = True,
+        since_ts: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Fetch all messages in a project with a given topic tag, regardless of recipient.
+
+        Parameters
+        ----------
+        project_key : str
+            Project identifier.
+        topic_name : str
+            The topic tag to filter by (case-insensitive).
+        limit : int
+            Max number of messages to return (default 50).
+        include_bodies : bool
+            Include full Markdown bodies in the payloads (default true).
+        since_ts : Optional[str]
+            ISO-8601 timestamp; only messages newer than this are returned.
+
+        Returns
+        -------
+        list[dict]
+            Each message includes: { id, subject, from, created_ts, importance, topic, [body_md] }
+        """
+        _validate_iso_timestamp(since_ts, "since_ts")
+        project = await _get_project_by_identifier(project_key)
+        if not topic_name or not topic_name.strip():
+            raise ToolExecutionError(
+                "INVALID_ARGUMENT",
+                "topic_name must be a non-empty string.",
+                recoverable=True,
+                data={"argument": "topic_name"},
+            )
+        if limit < 1:
+            limit = 1
+        if limit > 1000:
+            limit = 1000
+        sender_alias = aliased(Agent)
+        await ensure_schema()
+        async with get_session() as session:
+            stmt = (
+                select(Message, sender_alias.name)
+                .join(sender_alias, cast(Any, Message.sender_id == sender_alias.id))
+                .where(
+                    cast(Any, Message.project_id) == project.id,
+                    cast(Any, func.lower(Message.topic)) == topic_name.strip().lower(),
+                )
+                .order_by(desc(Message.created_ts))
+                .limit(limit)
+            )
+            if since_ts:
+                since_dt = _parse_iso(since_ts)
+                if since_dt:
+                    stmt = stmt.where(Message.created_ts > _naive_utc(since_dt))
+            result = await session.execute(stmt)
+            rows = result.all()
+        messages: list[dict[str, Any]] = []
+        for message, sender_name in rows:
+            payload = _message_to_dict(message, include_body=include_bodies)
+            payload["from"] = sender_name
+            messages.append(payload)
+        await ctx.info(f"Fetched {len(messages)} messages with topic '{topic_name}'.")
+        return messages
 
     @mcp.tool(name="mark_message_read")
     @_instrument_tool(
@@ -7258,6 +7773,299 @@ def build_mcp_server() -> FastMCP:
 
         await ctx.info(f"Summarized {len(thread_ids)} thread(s) for project '{project.human_key}'.")
         return {"threads": thread_summaries, "aggregate": aggregate}
+
+    # ── On-demand project-wide summarization (bd-1ia) ────────────────────
+
+    @mcp.tool(name="summarize_recent")
+    @_instrument_tool(
+        "summarize_recent",
+        cluster=CLUSTER_SEARCH,
+        capabilities={"summarization", "search"},
+        project_arg="project_key",
+    )
+    async def summarize_recent(
+        ctx: Context,
+        project_key: str,
+        since_hours: float = 1.0,
+        llm_mode: bool = True,
+        llm_model: Optional[str] = None,
+        max_messages: int = 500,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Summarize all recent project messages within a time window.
+
+        Fetches messages from the last ``since_hours`` hours, groups them by
+        thread, and produces a combined project-wide summary.  Results are
+        stored in the ``message_summaries`` table for fast retrieval via
+        ``fetch_summary``.
+
+        Idempotent: if a summary already exists for the same time window
+        (within 5-minute tolerance) it is returned from cache.
+
+        Parameters
+        ----------
+        project_key : str
+            Project identifier (slug or human key).
+        since_hours : float
+            How far back to look (default 1 hour).
+        llm_mode : bool
+            Use LLM to refine the summary (default True).
+        llm_model : str, optional
+            Override LLM model name.
+        max_messages : int
+            Maximum messages to include (default 500, capped at 500).
+        format : str, optional
+            Output format (json or toon).
+        """
+        import json as _json
+
+        project = await _get_project_by_identifier(project_key)
+        if project.id is None:
+            raise ToolExecutionError("PROJECT_NOT_FOUND", "Project has no id.", recoverable=True)
+
+        max_messages = min(max_messages, 500)
+        now = _naive_utc()
+        window_start = now - timedelta(hours=since_hours)
+
+        # ── Idempotency: check for cached summary within 5-min tolerance ──
+        await ensure_schema()
+        tolerance = timedelta(minutes=5)
+        async with get_session() as session:
+            cached_stmt = (
+                select(MessageSummary)
+                .where(
+                    cast(Any, MessageSummary.project_id) == project.id,
+                    cast(Any, MessageSummary.start_ts) >= (window_start - tolerance),
+                    cast(Any, MessageSummary.start_ts) <= (window_start + tolerance),
+                    cast(Any, MessageSummary.end_ts) >= (now - tolerance),
+                    cast(Any, MessageSummary.end_ts) <= (now + tolerance),
+                )
+                .order_by(desc(cast(Any, MessageSummary.created_ts)))
+                .limit(1)
+            )
+            cached_result = await session.execute(cached_stmt)
+            cached = cached_result.scalars().first()
+            if cached:
+                await ctx.info(f"Returning cached summary (id={cached.id}, created={_iso(cached.created_ts)}).")
+                return {
+                    "id": cached.id,
+                    "cached": True,
+                    "summary_text": cached.summary_text,
+                    "start_ts": _iso(cached.start_ts),
+                    "end_ts": _iso(cached.end_ts),
+                    "source_message_count": cached.source_message_count,
+                    "source_thread_ids": _json.loads(cached.source_thread_ids),
+                    "llm_model": cached.llm_model,
+                    "cost_usd": cached.cost_usd,
+                    "created_ts": _iso(cached.created_ts),
+                }
+
+        # ── Fetch messages in window ──
+        sender_alias = aliased(Agent)
+        async with get_session() as session:
+            stmt = (
+                select(Message, sender_alias.name)
+                .join(sender_alias, cast(Any, Message.sender_id == sender_alias.id))
+                .where(
+                    cast(Any, Message.project_id) == project.id,
+                    cast(Any, Message.created_ts) >= window_start,
+                )
+                .order_by(asc(cast(Any, Message.created_ts)))
+                .limit(max_messages)
+            )
+            result = await session.execute(stmt)
+            raw_rows = result.all()
+        rows = [(row[0], row[1]) for row in raw_rows]
+
+        if not rows:
+            await ctx.info(f"No messages in the last {since_hours}h for project '{project.human_key}'.")
+            return {
+                "id": None,
+                "cached": False,
+                "summary_text": f"No activity in the last {since_hours} hours.",
+                "start_ts": _iso(window_start),
+                "end_ts": _iso(now),
+                "source_message_count": 0,
+                "source_thread_ids": [],
+                "llm_model": None,
+                "cost_usd": None,
+                "created_ts": _iso(now),
+            }
+
+        truncated = len(raw_rows) >= max_messages
+
+        # ── Group by thread ──
+        threads: dict[str, list[tuple[Message, str]]] = {}
+        for msg, sender in rows:
+            tid = msg.thread_id or f"msg-{msg.id}"
+            threads.setdefault(tid, []).append((msg, sender))
+
+        thread_ids_list = sorted(threads.keys())
+
+        # ── Heuristic summary per thread ──
+        all_summaries: list[dict[str, Any]] = []
+        for tid, thread_msgs in threads.items():
+            s = _summarize_messages(thread_msgs)
+            s["thread_id"] = tid
+            s["message_count"] = len(thread_msgs)
+            all_summaries.append(s)
+
+        # ── Combine into project-wide summary ──
+        all_participants: set[str] = set()
+        all_key_points: list[str] = []
+        all_action_items: list[str] = []
+        total_open = 0
+        total_done = 0
+        for s in all_summaries:
+            all_participants.update(s.get("participants", []))
+            all_key_points.extend(s.get("key_points", []))
+            all_action_items.extend(s.get("action_items", []))
+            total_open += s.get("open_actions", 0)
+            total_done += s.get("done_actions", 0)
+
+        combined = {
+            "participants": sorted(all_participants),
+            "key_points": all_key_points[:20],
+            "action_items": all_action_items[:20],
+            "total_messages": len(rows),
+            "total_threads": len(threads),
+            "open_actions": total_open,
+            "done_actions": total_done,
+        }
+        if truncated:
+            combined["truncated"] = True
+            combined["truncation_note"] = f"Limited to {max_messages} most recent messages."
+
+        summary_text = _json.dumps(combined)
+        cost_usd: Optional[float] = None
+        used_model: Optional[str] = None
+
+        # ── LLM refinement ──
+        if llm_mode and get_settings().llm.enabled and rows:
+            try:
+                excerpts: list[str] = []
+                for msg, sender in rows[:30]:
+                    tid = msg.thread_id or f"msg-{msg.id}"
+                    excerpts.append(f"[{tid}] {sender}: {msg.subject}\n{msg.body_md[:400]}")
+                system = (
+                    "You are a senior engineering lead. Summarize the following project messages "
+                    "from the given time window into a concise JSON with keys: "
+                    "key_decisions[], blockers_resolved[], work_completed[], open_questions[], "
+                    "participants[], total_messages (int), total_threads (int). "
+                    "Be specific and actionable."
+                )
+                user = f"Time window: last {since_hours}h\n\n" + "\n\n".join(excerpts)
+                llm_resp = await complete_system_user(system, user, model=llm_model)
+                used_model = llm_resp.model
+                cost_usd = getattr(llm_resp, "estimated_cost_usd", None)
+                parsed = _parse_json_safely(llm_resp.content)
+                if parsed:
+                    # Preserve heuristic counts but use LLM text
+                    parsed["total_messages"] = len(rows)
+                    parsed["total_threads"] = len(threads)
+                    if truncated:
+                        parsed["truncated"] = True
+                    summary_text = _json.dumps(parsed)
+            except Exception as e:
+                await ctx.debug(f"summarize_recent.llm_skipped: {e}")
+
+        # ── Store summary ──
+        async with get_session() as session:
+            summary_row = MessageSummary(
+                project_id=project.id,
+                summary_text=summary_text,
+                start_ts=window_start,
+                end_ts=now,
+                source_message_count=len(rows),
+                source_thread_ids=_json.dumps(thread_ids_list),
+                llm_model=used_model,
+                cost_usd=cost_usd,
+            )
+            session.add(summary_row)
+            await session.commit()
+            await session.refresh(summary_row)
+
+        await ctx.info(
+            f"Summarized {len(rows)} messages across {len(threads)} threads "
+            f"for project '{project.human_key}' (id={summary_row.id})."
+        )
+        return {
+            "id": summary_row.id,
+            "cached": False,
+            "summary_text": summary_text,
+            "start_ts": _iso(window_start),
+            "end_ts": _iso(now),
+            "source_message_count": len(rows),
+            "source_thread_ids": thread_ids_list,
+            "llm_model": used_model,
+            "cost_usd": cost_usd,
+            "created_ts": _iso(summary_row.created_ts),
+        }
+
+    @mcp.tool(name="fetch_summary")
+    @_instrument_tool(
+        "fetch_summary",
+        cluster=CLUSTER_SEARCH,
+        capabilities={"summarization", "read"},
+        project_arg="project_key",
+    )
+    async def fetch_summary(
+        ctx: Context,
+        project_key: str,
+        since_hours: float = 24.0,
+        limit: int = 5,
+        format: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Retrieve stored project-wide summaries.
+
+        Parameters
+        ----------
+        project_key : str
+            Project identifier.
+        since_hours : float
+            Return summaries whose end_ts is within this window (default 24h).
+        limit : int
+            Maximum summaries to return (default 5).
+        format : str, optional
+            Output format.
+        """
+        import json as _json
+
+        project = await _get_project_by_identifier(project_key)
+        if project.id is None:
+            raise ToolExecutionError("PROJECT_NOT_FOUND", "Project has no id.", recoverable=True)
+
+        cutoff = _naive_utc() - timedelta(hours=since_hours)
+        await ensure_schema()
+        async with get_session() as session:
+            stmt = (
+                select(MessageSummary)
+                .where(
+                    cast(Any, MessageSummary.project_id) == project.id,
+                    cast(Any, MessageSummary.end_ts) >= cutoff,
+                )
+                .order_by(desc(cast(Any, MessageSummary.created_ts)))
+                .limit(limit)
+            )
+            result = await session.execute(stmt)
+            summaries = result.scalars().all()
+
+        items: list[dict[str, Any]] = []
+        for s in summaries:
+            items.append({
+                "id": s.id,
+                "summary_text": s.summary_text,
+                "start_ts": _iso(s.start_ts),
+                "end_ts": _iso(s.end_ts),
+                "source_message_count": s.source_message_count,
+                "source_thread_ids": _json.loads(s.source_thread_ids),
+                "llm_model": s.llm_model,
+                "cost_usd": s.cost_usd,
+                "created_ts": _iso(s.created_ts),
+            })
+
+        await ctx.info(f"Fetched {len(items)} stored summaries for project '{project.human_key}'.")
+        return items
 
     @mcp.tool(name="install_precommit_guard")
     @_instrument_tool("install_precommit_guard", cluster=CLUSTER_SETUP, capabilities={"infrastructure", "repository"}, project_arg="project_key")
